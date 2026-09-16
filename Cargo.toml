@@ -1,0 +1,14 @@
+[package]
+name = "minipdf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.34"
+pdfium-render = "0.9"
+image = "0.25"
+rfd = "0.15"
+
+[profile.release]
+opt-level = 2
+strip = true
