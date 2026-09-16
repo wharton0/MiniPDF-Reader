@@ -394,6 +394,8 @@ struct DocTab {
     highlight_rgb: (u8, u8, u8),
     markup_stack: Vec<i32>, // pages of markups created this session (for undo)
     drag_anchor: Option<(i32, usize)>,
+    page_box: String,   // toolbar page-number field (committed with Enter)
+    page_box_cur: i32,  // which `cur` the field currently reflects (-1 = needs sync)
 }
 
 impl DocTab {
@@ -419,6 +421,8 @@ impl DocTab {
             markup_stack: Vec::new(),
             selection: None,
             drag_anchor: None,
+            page_box: String::new(),
+            page_box_cur: -1,
         }
     }
 
@@ -1372,22 +1376,40 @@ impl MiniPdf {
                 let cur = self.tabs.get(tab_idx).map(|t| t.cur).unwrap_or(0);
                 self.goto(tab_idx, cur - 1);
             }
-            let mut n = self.tabs.get(tab_idx).map(|t| t.cur + 1).unwrap_or(1);
-            let page_resp = ui.add_enabled(
-                can_nav,
-                egui::DragValue::new(&mut n)
-                    .range(1..=pages.max(1))
-                    .prefix("Page ")
-                    .suffix(""),
-            );
-            // Commit only: jumping on every keystroke breaks multi-digit input.
-            // NOTE: Enter rarely moves focus out of the editor, so has_focus must count too.
-            let committed = page_resp.drag_stopped()
-                || ((page_resp.has_focus() || page_resp.lost_focus())
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            let cur = self.tabs.get(tab_idx).map(|t| t.cur).unwrap_or(0);
-            if committed && can_nav && n - 1 != cur {
-                self.goto(tab_idx, n - 1);
+            // Page box: plain text field, Enter jumps. (DragValue swallowed
+            // Enter inside its own editor, so the outer key check never fired.)
+            ui.label("Page");
+            let mut do_goto: Option<i32> = None;
+            if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                let resp = ui.add_enabled(
+                    can_nav,
+                    egui::TextEdit::singleline(&mut tab.page_box).desired_width(44.0),
+                );
+                // Keep the field in sync when the page changes elsewhere,
+                // but never clobber what the user is currently typing.
+                if !resp.has_focus() && tab.page_box_cur != tab.cur {
+                    tab.page_box = (tab.cur + 1).to_string();
+                    tab.page_box_cur = tab.cur;
+                }
+                if (resp.has_focus() || resp.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    match tab.page_box.trim().parse::<i32>() {
+                        Ok(n) if (1..=pages).contains(&n) && n - 1 != tab.cur => {
+                            do_goto = Some(n - 1);
+                        }
+                        _ => {
+                            // invalid input: snap the field back to the current page
+                            tab.page_box = (tab.cur + 1).to_string();
+                            tab.page_box_cur = tab.cur;
+                        }
+                    }
+                }
+            }
+            if let Some(p) = do_goto {
+                if can_nav {
+                    self.goto(tab_idx, p);
+                }
             }
             ui.label(format!("/ {pages}"));
             if ui.add_enabled(can_nav, egui::Button::new("▶")).clicked() {
