@@ -1381,8 +1381,10 @@ impl MiniPdf {
                     .suffix(""),
             );
             // Commit only: jumping on every keystroke breaks multi-digit input.
+            // NOTE: Enter rarely moves focus out of the editor, so has_focus must count too.
             let committed = page_resp.drag_stopped()
-                || (page_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                || ((page_resp.has_focus() || page_resp.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             let cur = self.tabs.get(tab_idx).map(|t| t.cur).unwrap_or(0);
             if committed && can_nav && n - 1 != cur {
                 self.goto(tab_idx, n - 1);
