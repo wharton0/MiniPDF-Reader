@@ -1588,7 +1588,7 @@ impl MiniPdf {
                     let has = total > 0;
                     if ui
                         .add_enabled(has, egui::Button::new("▶"))
-                        .on_hover_text("Next match (Enter)")
+                        .on_hover_text("Next match (Enter or F3)")
                         .clicked()
                     {
                         self.step_match(tab_idx, 1);
@@ -1600,7 +1600,7 @@ impl MiniPdf {
                     }
                     if ui
                         .add_enabled(has, egui::Button::new("◀"))
-                        .on_hover_text("Previous match (Shift+Enter)")
+                        .on_hover_text("Previous match (Shift+Enter or Shift+F3)")
                         .clicked()
                     {
                         self.step_match(tab_idx, -1);
@@ -1619,7 +1619,7 @@ impl MiniPdf {
                         let resp = ui.add_enabled(
                             can_nav,
                             egui::TextEdit::singleline(&mut t.search_text)
-                                .hint_text("Search, Enter = next")
+                                .hint_text("Search, Enter/F3 = next")
                                 .desired_width(130.0)
                                 .frame(
                                     egui::Frame::new()
@@ -1826,6 +1826,15 @@ impl MiniPdf {
         if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::PageUp)) {
             let cur = self.tabs.get(tab_idx).map(|t| t.cur).unwrap_or(0);
             self.goto(tab_idx, cur - 1);
+        }
+        // F3 / Shift+F3: next / previous search match (Windows convention)
+        if ui.input(|i| i.key_pressed(egui::Key::F3)) {
+            let dir = if ui.input(|i| i.modifiers.shift) {
+                -1
+            } else {
+                1
+            };
+            self.step_match(tab_idx, dir);
         }
         // Ctrl+A: select all text on current page
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
