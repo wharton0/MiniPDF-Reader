@@ -458,6 +458,10 @@ struct MiniPdf {
     focus_search: bool,
     fullscreen: bool,
     last_title: String,
+    // UI icons decoded synchronously at startup (no async bytes-loader involved).
+    tex_highlight: Option<egui::TextureHandle>,
+    tex_highlight_disabled: Option<egui::TextureHandle>,
+    tex_logo: Option<egui::TextureHandle>,
 }
 
 impl Default for MiniPdf {
@@ -472,6 +476,9 @@ impl Default for MiniPdf {
             focus_search: false,
             fullscreen: false,
             last_title: String::new(),
+            tex_highlight: None,
+            tex_highlight_disabled: None,
+            tex_logo: None,
         }
     }
 }
@@ -1445,27 +1452,32 @@ impl MiniPdf {
             }
             // one-click highlight shortcut: Lucide "highlighter" glyph
             // (ISC licensed, baked on toolbar gray), with the selection actions.
+            // Uses the pre-decoded startup texture: synchronous, never the ⚠ placeholder.
             {
                 let h = ui.spacing().interact_size.y.max(20.0);
-                let (uri, bytes) = if has_sel {
-                    (
-                        "bytes://minipdf/highlight.png",
-                        include_bytes!("../assets/highlight.png").as_slice(),
-                    )
+                let img = if has_sel {
+                    match &self.tex_highlight {
+                        Some(tex) => egui::Image::new((tex.id(), egui::vec2(18.0, 18.0)))
+                            .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                        None => egui::Image::from_bytes(
+                            "bytes://minipdf/highlight.png",
+                            include_bytes!("../assets/highlight.png").as_slice(),
+                        )
+                        .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                    }
                 } else {
-                    (
-                        "bytes://minipdf/highlight-disabled.png",
-                        include_bytes!("../assets/highlight-disabled.png").as_slice(),
-                    )
+                    match &self.tex_highlight_disabled {
+                        Some(tex) => egui::Image::new((tex.id(), egui::vec2(18.0, 18.0)))
+                            .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                        None => egui::Image::from_bytes(
+                            "bytes://minipdf/highlight-disabled.png",
+                            include_bytes!("../assets/highlight-disabled.png").as_slice(),
+                        )
+                        .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                    }
                 };
                 let resp = ui
-                    .add_sized(
-                        egui::vec2(30.0, h),
-                        egui::Button::image(
-                            egui::Image::from_bytes(uri, bytes)
-                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                        ),
-                    )
+                    .add_sized(egui::vec2(30.0, h), egui::Button::image(img))
                     .on_hover_text("Highlight the selection (uses the Markup color)");
                 if has_sel && resp.clicked() {
                     self.add_markup(tab_idx, MarkupKind::Highlight);
@@ -1623,7 +1635,9 @@ impl MiniPdf {
                         if want_focus {
                             resp.request_focus();
                         }
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if (resp.has_focus() || resp.lost_focus())
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
                             let stale = t.search_text.trim().to_lowercase() != t.search_query;
                             let shift = ui.input(|i| i.modifiers.shift);
                             act = if stale {
@@ -2417,13 +2431,20 @@ impl eframe::App for MiniPdf {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
-                        ui.add(
-                            egui::Image::from_bytes(
-                                "bytes://minipdf/logo-256.png",
-                                include_bytes!("../assets/logo-256.png").as_slice(),
-                            )
-                            .max_size(egui::vec2(112.0, 112.0)),
-                        );
+                        if let Some(tex) = &self.tex_logo {
+                            ui.add(
+                                egui::Image::new((tex.id(), egui::vec2(112.0, 112.0)))
+                                    .max_size(egui::vec2(112.0, 112.0)),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Image::from_bytes(
+                                    "bytes://minipdf/logo-256.png",
+                                    include_bytes!("../assets/logo-256.png").as_slice(),
+                                )
+                                .max_size(egui::vec2(112.0, 112.0)),
+                            );
+                        }
                         ui.add_space(8.0);
                         ui.heading("MiniPDF");
                         ui.label("Drag PDF files here, or press Ctrl+O");
@@ -2471,6 +2492,20 @@ fn setup_cjk_ui_font(ctx: &egui::Context) {
         fonts.families.entry(fam).or_default().push("cjk".to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+/// Decode an embedded PNG into a texture synchronously.
+/// Unlike `Image::from_bytes` (async bytes-loader), this can never show the ⚠ placeholder.
+fn load_embedded_tex(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &'static [u8],
+) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let cimg = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
+    Some(ctx.load_texture(name, cimg, egui::TextureOptions::LINEAR))
 }
 
 fn find_window_icon() -> Option<egui::IconData> {
@@ -2574,6 +2609,22 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.active.corner_radius = flat_radius;
             visuals.widgets.active.fg_stroke = glyph_hover;
             cc.egui_ctx.set_visuals(visuals);
+            // Pre-decode UI icons to textures (synchronous; never shows ⚠).
+            app.tex_highlight = load_embedded_tex(
+                &cc.egui_ctx,
+                "minipdf-highlight",
+                include_bytes!("../assets/highlight.png"),
+            );
+            app.tex_highlight_disabled = load_embedded_tex(
+                &cc.egui_ctx,
+                "minipdf-highlight-disabled",
+                include_bytes!("../assets/highlight-disabled.png"),
+            );
+            app.tex_logo = load_embedded_tex(
+                &cc.egui_ctx,
+                "minipdf-logo",
+                include_bytes!("../assets/logo-256.png"),
+            );
             cc.egui_ctx.include_bytes(
                 "bytes://minipdf/highlight.png",
                 include_bytes!("../assets/highlight.png"),
