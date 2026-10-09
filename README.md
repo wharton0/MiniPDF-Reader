@@ -19,6 +19,10 @@ A minimal PDF viewer written in **Rust** using **Pdfium** and **egui**. Designed
 - Print (whole document or current page) via system print dialog
 - Fullscreen mode (F11/Esc) hiding toolbar/sidebar/status
 - Annotation/markup: highlight, underline, strike-out with color picker (yellow/green/blue/pink)
+- Sticky-note annotations (right-click on a page → Add note here)
+- Page management: rotate left/right, delete page (right-click a sidebar thumbnail)
+- Merge: append another PDF at the end (File → Append PDF…)
+- Export: current page or all pages as PNG/JPEG (File → Export as image)
 - Undo/redo per tab for markup
 - Save (`Ctrl+S`) and Save As
 - Color scheme: forced light theme, Catalina v2 palette

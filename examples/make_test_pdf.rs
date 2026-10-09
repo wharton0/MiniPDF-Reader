@@ -12,8 +12,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pdf.extend_from_slice(body.as_bytes());
     };
     pdf.extend_from_slice(b"%PDF-1.4\n");
-    obj(&mut pdf, &mut offsets, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-    obj(&mut pdf, &mut offsets, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    obj(
+        &mut pdf,
+        &mut offsets,
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    );
+    obj(
+        &mut pdf,
+        &mut offsets,
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    );
     obj(
         &mut pdf,
         &mut offsets,

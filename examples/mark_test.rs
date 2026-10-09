@@ -56,7 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let b = ch.loose_bounds()?;
-            v.push((b.left().value, b.bottom().value, b.right().value, b.top().value));
+            v.push((
+                b.left().value,
+                b.bottom().value,
+                b.right().value,
+                b.top().value,
+            ));
         }
         v
     };

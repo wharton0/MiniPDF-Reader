@@ -40,7 +40,13 @@ fn plot(img: &mut RgbaImage, x: i32, y: i32, c: Rgba<u8>) {
 
 /// Filled rounded rect in design pixels (scaled by SS internally).
 fn rrect(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, r: i32, c: Rgba<u8>) {
-    let (x0, y0, x1, y1, r) = (x0 * SS as i32, y0 * SS as i32, x1 * SS as i32, y1 * SS as i32, r * SS as i32);
+    let (x0, y0, x1, y1, r) = (
+        x0 * SS as i32,
+        y0 * SS as i32,
+        x1 * SS as i32,
+        y1 * SS as i32,
+        r * SS as i32,
+    );
     let r = r.min((x1 - x0) / 2).min((y1 - y0) / 2).max(0);
     let rf = r as f32;
     for y in y0..y1 {
@@ -117,7 +123,15 @@ fn draw_logo(px: u32) -> RgbaImage {
     let mut img = RgbaImage::new(s, s);
     // soft shadow under the card
     for (dy, a) in [(14, 26u8), (10, 30), (6, 36)] {
-        rrect(&mut img, 28, 28 + dy, 228, 228 + dy, 52, Rgba([20, 25, 35, a]));
+        rrect(
+            &mut img,
+            28,
+            28 + dy,
+            228,
+            228 + dy,
+            52,
+            Rgba([20, 25, 35, a]),
+        );
     }
     // photo card: diagonal cyan -> blue -> pink gradient (original art,
     // Preview-vibe background)

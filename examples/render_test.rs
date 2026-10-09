@@ -4,7 +4,9 @@ use pdfium_render::prelude::*;
 
 fn main() {
     let pdfium = ensure_pdfium().expect("pdfium init failed");
-    let pdf = std::env::args().nth(1).expect("usage: render_test <file.pdf> [page]");
+    let pdf = std::env::args()
+        .nth(1)
+        .expect("usage: render_test <file.pdf> [page]");
     let idx: i32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

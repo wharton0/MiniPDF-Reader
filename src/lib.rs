@@ -116,7 +116,11 @@ pub struct CjkFallbackProvider {
 
 impl CjkFallbackProvider {
     pub fn new(cjk: Vec<u8>, latin: Option<Vec<u8>>) -> Self {
-        Self { next_id: 1, cjk, latin }
+        Self {
+            next_id: 1,
+            cjk,
+            latin,
+        }
     }
 }
 
@@ -153,6 +157,17 @@ impl PdfiumCustomFontProvider for CjkFallbackProvider {
     }
 }
 
+fn reuse_or_bind(
+    bind: Result<Box<dyn PdfiumLibraryBindings>, PdfiumError>,
+    what: &str,
+) -> Result<Pdfium, String> {
+    match bind {
+        Ok(b) => finish_bind(b),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
+        Err(e) => Err(format!("Failed to bind {what}: {e}")),
+    }
+}
+
 /// 绑定 Pdfium 并装好字体回退。cjk.ttf 缺失时退化为系统默认 provider。
 pub fn ensure_pdfium() -> Result<Pdfium, String> {
     if let Ok(p) = std::env::var("PDFIUM_LIB_PATH") {
@@ -162,9 +177,10 @@ pub fn ensure_pdfium() -> Result<Pdfium, String> {
                 .parent()
                 .map(|d| d.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
-            return finish_bind(
-                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
-                    .map_err(|e| format!("Failed to bind {}: {e}", p.display()))?,
+            let display = p.display().to_string();
+            return reuse_or_bind(
+                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir)),
+                &display,
             );
         }
     }
@@ -174,34 +190,35 @@ pub fn ensure_pdfium() -> Result<Pdfium, String> {
                 .parent()
                 .map(|d| d.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
-            match Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir)) {
-                Ok(b) => return finish_bind(b),
-                Err(e) => return Err(format!("Failed to bind {}: {e}", p.display())),
-            }
+            let display = p.display().to_string();
+            return reuse_or_bind(
+                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir)),
+                &display,
+            );
         }
     }
     match Pdfium::bind_to_system_library() {
         Ok(b) => finish_bind(b),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
         Err(_) => Err("pdfium.dll not found. Put it next to minipdf.exe.".to_owned()),
     }
 }
 
-fn finish_bind(
-    bindings: Box<dyn PdfiumLibraryBindings>,
-) -> Result<Pdfium, String> {
+fn finish_bind(bindings: Box<dyn PdfiumLibraryBindings>) -> Result<Pdfium, String> {
     let mut pdfium = Pdfium::new(bindings);
-    match find_cjk_font_path()
-        .and_then(|p| std::fs::read(p).ok())
-    {
+    match find_cjk_font_path().and_then(|p| std::fs::read(p).ok()) {
         Some(cjk) => {
             let latin = find_latin_font_bytes();
             pdfium.set_custom_font_provider(Box::new(CjkFallbackProvider::new(cjk, latin)));
-            Ok(pdfium)
         }
         None => {
             // 没有 cjk.ttf:至少打开系统 provider,能显示已安装的中文字体。
             let _ = pdfium.use_platform_default_font_provider();
-            Ok(pdfium)
         }
     }
+    // provider 指针被 pdfium 库全局持有,必须活到进程结束:任何短命调用者
+    // (后台线程、单次抓取) 的提前释放都会留下悬垂指针,多线程下直接崩溃。
+    // 因此泄漏此次绑定,返回复用全局绑定的轻量句柄。
+    std::mem::forget(pdfium);
+    Ok(Pdfium::default())
 }
