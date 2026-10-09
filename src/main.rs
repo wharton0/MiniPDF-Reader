@@ -5,43 +5,42 @@
 // text select+copy / print(whole doc + current page) / wheel paging.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc,
 };
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TabId(u64);
+mod pdf_util;
+mod platform;
+mod search;
+mod theme;
+mod types;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct DocVersion {
-    id: TabId,
-    revision: u64,
-}
+use eframe::egui;
+use minipdf::{ensure_pdfium, find_cjk_font_path};
+use pdfium_render::prelude::*;
 
-type RenderKey = (DocVersion, i32, u32);
-type LayerKey = (DocVersion, i32);
-type RenderData = (Vec<u8>, usize, usize);
-type LayerData = (Vec<CharInfo>, Vec<PageLink>, Vec<PdfImage>, (f32, f32));
-type RenderMessage = (RenderKey, Result<RenderData, String>);
-type LayerMessage = (LayerKey, Result<LayerData, String>);
-type SearchMessage = (DocVersion, u64, Result<SearchOutput, String>);
-type OutlineMessage = (DocVersion, Result<Vec<OutlineItem>, String>);
-type NotesMessage = (DocVersion, Result<Vec<NoteItem>, String>);
+use pdf_util::*;
+use platform::*;
+use search::*;
+use theme::*;
+use types::*;
 
 const TEXTURE_BUDGET: usize = 192 * 1024 * 1024;
 const MAX_LAYER_THREADS: usize = 2;
 /// Fixed render width for image export (~200 dpi on a Letter page).
 const EXPORT_WIDTH: u32 = 2000;
-
-fn render_width(zoom: f32) -> u32 {
-    ((RENDER_BASE_WIDTH as f32 * zoom) as i32).clamp(1, MAX_RENDER_WIDTH) as u32
-}
-
-fn normalized_query(text: &str) -> String {
-    text.trim().chars().map(lower1).collect()
-}
+const THUMB_WIDTH: i32 = 132;
+/// Max concurrent background render threads (page + thumbnail combined).
+const MAX_RENDER_THREADS: usize = 4;
+const HIGHLIGHT_COLORS: &[(&str, (u8, u8, u8))] = &[
+    ("Yellow", (255, 255, 0)),
+    ("Green", (146, 208, 80)),
+    ("Blue", (155, 194, 230)),
+    ("Pink", (255, 153, 204)),
+];
 
 fn worker_result<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
@@ -73,236 +72,6 @@ fn spawn_worker<T: Send + 'static>(
     }
 }
 
-#[derive(Default)]
-struct SearchOutput {
-    matches: Vec<SearchMatch>,
-    snippets: Vec<String>,
-    truncated: bool,
-}
-
-fn search_page(
-    out: &mut SearchOutput,
-    page: i32,
-    chars: &[CharInfo],
-    query: &[char],
-    cancel: &AtomicBool,
-) {
-    if query.is_empty() {
-        return;
-    }
-    let text: Vec<char> = chars.iter().map(|c| lower1(c.ch)).collect();
-    let mut start = 0;
-    let mut count = 0;
-    while start + query.len() <= text.len() {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        if text[start..start + query.len()] == *query {
-            if count >= 500 || out.matches.len() >= 5000 {
-                out.truncated = true;
-                return;
-            }
-            let end = start + query.len() - 1;
-            out.matches.push(SearchMatch { page, start, end });
-            let raw: String = chars[start.saturating_sub(28)..(end + 29).min(chars.len())]
-                .iter()
-                .take(160)
-                .map(|c| c.ch)
-                .collect();
-            out.snippets.push(format!(
-                "p.{} — {}",
-                page + 1,
-                raw.split_whitespace().collect::<Vec<_>>().join(" ")
-            ));
-            count += 1;
-            start += query.len();
-        } else {
-            start += 1;
-        }
-    }
-}
-
-/// One document-outline (bookmark) entry: Preview's Contents sidebar.
-#[derive(Clone)]
-struct OutlineItem {
-    title: String,
-    page: Option<i32>,
-    depth: usize,
-}
-
-/// Flatten a bookmark subtree into outline items (depth-first, capped).
-fn collect_outline(bm: &PdfBookmark<'_>, depth: usize, out: &mut Vec<OutlineItem>, cap: usize) {
-    if out.len() >= cap {
-        return;
-    }
-    out.push(OutlineItem {
-        title: bm.title().unwrap_or_default(),
-        page: bookmark_page(bm),
-        depth,
-    });
-    let mut child = bm.first_child();
-    while let Some(c) = child {
-        collect_outline(&c, depth + 1, out, cap);
-        if out.len() >= cap {
-            return;
-        }
-        child = c.next_sibling();
-    }
-}
-
-fn bookmark_page(bm: &PdfBookmark<'_>) -> Option<i32> {
-    if let Some(dest) = bm.destination() {
-        if let Ok(p) = dest.page_index() {
-            return Some(p as i32);
-        }
-    }
-    if let Some(act) = bm.action() {
-        if let Some(local) = act.as_local_destination_action() {
-            if let Ok(dest) = local.destination() {
-                if let Ok(p) = dest.page_index() {
-                    return Some(p as i32);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// One annotation entry for the Notes sidebar (Preview Highlights & Notes).
-#[derive(Clone)]
-struct NoteItem {
-    page: i32,
-    index: usize,
-    label: &'static str,
-    text: String, // annotation Contents (note text; empty for plain markup)
-}
-
-/// First 48 chars of a note, single-line, for the Notes list.
-fn note_snippet(text: &str) -> String {
-    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut s: String = one_line.chars().take(48).collect();
-    if one_line.chars().count() > 48 {
-        s.push('…');
-    }
-    s
-}
-
-fn annotation_label(t: PdfPageAnnotationType) -> Option<&'static str> {
-    Some(match t {
-        PdfPageAnnotationType::Highlight => "Highlight",
-        PdfPageAnnotationType::Underline => "Underline",
-        PdfPageAnnotationType::Strikeout => "Strikethrough",
-        PdfPageAnnotationType::Squiggly => "Squiggly",
-        PdfPageAnnotationType::Square | PdfPageAnnotationType::Circle => "Markup",
-        PdfPageAnnotationType::Ink => "Ink",
-        PdfPageAnnotationType::FreeText => "Text box",
-        PdfPageAnnotationType::Text => "Note",
-        PdfPageAnnotationType::Stamp => "Stamp",
-        PdfPageAnnotationType::Line
-        | PdfPageAnnotationType::Polygon
-        | PdfPageAnnotationType::Polyline => "Shape",
-        PdfPageAnnotationType::Caret => "Caret",
-        PdfPageAnnotationType::FileAttachment => "Attachment",
-        PdfPageAnnotationType::Redacted => "Redaction",
-        PdfPageAnnotationType::Link
-        | PdfPageAnnotationType::Widget
-        | PdfPageAnnotationType::XfaWidget
-        | PdfPageAnnotationType::Popup
-        | PdfPageAnnotationType::Unknown => return None,
-        _ => "Annotation",
-    })
-}
-
-/// Enumerate markup/note annotations across all pages (links/widgets skipped).
-fn fetch_notes(path: &Path) -> Result<Vec<NoteItem>, String> {
-    let pdfium = minipdf::ensure_pdfium()?;
-    let document = pdfium
-        .load_pdf_from_file(path, None)
-        .map_err(|e| e.to_string())?;
-    let pages = document.pages();
-    let mut out = Vec::new();
-    for page in 0..pages.len() {
-        let pg = pages.get(page).map_err(|e| e.to_string())?;
-        let annots = pg.annotations();
-        if annots.is_empty() {
-            continue;
-        }
-        for idx in annots.as_range() {
-            if out.len() >= 2000 {
-                return Ok(out);
-            }
-            let annot = annots.get(idx).map_err(|e| e.to_string())?;
-            let annot_type = annot.annotation_type();
-            let contents = annot.contents().unwrap_or_default();
-            // Squares carrying Contents are our sticky notes (highlight /
-            // underline / strikeout squares never set Contents).
-            let label = if annot_type == PdfPageAnnotationType::Square && !contents.is_empty() {
-                "Note"
-            } else {
-                match annotation_label(annot_type) {
-                    Some(l) => l,
-                    None => continue,
-                }
-            };
-            out.push(NoteItem {
-                page,
-                index: idx,
-                label,
-                text: contents,
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Load the document outline (bookmarks) for a file. Empty vec = no outline.
-fn fetch_outline(path: &Path) -> Result<Vec<OutlineItem>, String> {
-    let pdfium = minipdf::ensure_pdfium()?;
-    let document = pdfium
-        .load_pdf_from_file(path, None)
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    if let Some(root) = document.bookmarks().root() {
-        let mut sib = root.first_child();
-        while let Some(b) = sib {
-            collect_outline(&b, 0, &mut out, 2000);
-            sib = b.next_sibling();
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Clone, Copy)]
-struct MarkupUndo {
-    page: i32,
-    before_len: usize,
-    count: usize,
-}
-
-impl MarkupUndo {
-    fn valid(&self, current_len: usize) -> bool {
-        self.count > 0 && current_len == self.before_len + self.count
-    }
-}
-
-/// Per-file reading position persisted across launches.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Default)]
-struct FilePlace {
-    #[serde(default)]
-    page: i32,
-    #[serde(default)]
-    zoom: f32,
-}
-
-/// Whole-app persisted state: recent files + reading positions.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct AppStateFile {
-    #[serde(default)]
-    recent: Vec<PathBuf>,
-    #[serde(default)]
-    places: HashMap<PathBuf, FilePlace>,
-}
-
 const MAX_RECENT: usize = 8;
 const MAX_PLACES: usize = 50;
 
@@ -328,1067 +97,39 @@ fn save_state(state: &AppStateFile) {
     }
 }
 
+/// Generate a unique temporary path alongside the target file to avoid race conditions.
+fn unique_temp_pdf_path(path: &Path) -> PathBuf {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let count = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_extension(format!("pdf.minipdf-tmp-{pid}-{time}-{count}"))
+}
+
+/// Atomically replaces destination file with source file, retrying briefly on Windows if locked.
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                // Windows may momentarily lock file if background reader was closing
+                std::thread::sleep(Duration::from_millis(15 * (attempt + 1)));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
 /// Push a path to the front of recent (dedupe, cap). Pure for testability.
 fn push_recent(recent: &mut Vec<PathBuf>, path: PathBuf) {
     recent.retain(|p| *p != path);
     recent.insert(0, path);
     recent.truncate(MAX_RECENT);
-}
-use std::path::{Path, PathBuf};
-
-use eframe::egui;
-use minipdf::{ensure_pdfium, find_cjk_font_path};
-use pdfium_render::prelude::*;
-
-const THUMB_WIDTH: i32 = 132;
-const RENDER_BASE_WIDTH: i32 = 1100;
-/// Max render width in px (bounds memory: a 2600px page is ~38MB of RGBA).
-const MAX_RENDER_WIDTH: i32 = 2600;
-/// How many distinct pages keep a cached page texture (LRU by distance to `cur`).
-const MAX_PAGE_TEX_PAGES: usize = 16;
-/// Same idea for the per-page text/link/image layer caches.
-const MAX_LAYER_PAGES: usize = 32;
-/// Zoom snaps to this grid so re-visiting a level reuses cached textures.
-const ZOOM_STEP: f32 = 0.05;
-/// Max concurrent background render threads (page + thumbnail combined).
-const MAX_RENDER_THREADS: usize = 4;
-
-/// Snap zoom to a fixed grid (avoids float drift and makes texture keys reusable).
-fn snap_zoom(z: f32) -> f32 {
-    ((z / ZOOM_STEP).round() * ZOOM_STEP).clamp(0.2, 4.0)
-}
-
-/// Chrome surfaces (toolbar / sidebar / statusbar).
-/// Light: Catalina EB/F0/EB. Dark: macOS ~#2B2B2B / #252525 / #2B2B2B.
-fn preview_chrome(dark: bool) -> (egui::Color32, egui::Color32, egui::Color32) {
-    if dark {
-        (
-            egui::Color32::from_gray(43), // toolbar  #2B2B2B
-            egui::Color32::from_gray(37), // sidebar  #252525
-            egui::Color32::from_gray(43), // statusbar
-        )
-    } else {
-        (
-            egui::Color32::from_gray(235), // toolbar  #EBEBEB
-            egui::Color32::from_gray(240), // sidebar  #F0F0F0
-            egui::Color32::from_gray(235), // statusbar
-        )
-    }
-}
-
-/// Page canvas background. Light: #F5F5F5. Dark: #1A1A1A.
-fn preview_canvas(dark: bool) -> egui::Color32 {
-    if dark {
-        egui::Color32::from_gray(26) // #1A1A1A — darker than chrome so pages pop
-    } else {
-        egui::Color32::from_gray(245)
-    }
-}
-
-/// Text selection tint. Light: iOS blue 50%. Dark: iOS blue 55%.
-fn preview_selection(dark: bool) -> egui::Color32 {
-    if dark {
-        egui::Color32::from_rgba_unmultiplied(10, 132, 255, 140)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(0, 122, 255, 128)
-    }
-}
-
-/// Apple link blue (NSColor.linkColor): light #007AFF / dark #0A84FF.
-fn preview_link(dark: bool) -> egui::Color32 {
-    if dark {
-        egui::Color32::from_rgb(10, 132, 255)
-    } else {
-        egui::Color32::from_rgb(0, 122, 255)
-    }
-}
-
-/// 1px separator groove at a panel edge: rgba(0,0,0,0.10) single line.
-/// Painted foreground right after layout; edge: 0 = bottom, 1 = top, 2 = right.
-fn paint_groove(ui: &egui::Ui, rect: egui::Rect, edge: u8) {
-    if rect.height() <= 0.0 || rect.width() <= 0.0 {
-        return;
-    }
-    let p = ui.painter();
-    let dark = ui.visuals().dark_mode;
-    let line = if dark {
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 26)
-    };
-    match edge {
-        0 => {
-            p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, rect.max.y - 1.0),
-                    egui::pos2(rect.max.x, rect.max.y),
-                ),
-                0.0,
-                line,
-            );
-        }
-        1 => {
-            p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, rect.min.y),
-                    egui::pos2(rect.max.x, rect.min.y + 1.0),
-                ),
-                0.0,
-                line,
-            );
-        }
-        _ => {
-            p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.max.x - 1.0, rect.min.y),
-                    egui::pos2(rect.max.x, rect.max.y),
-                ),
-                0.0,
-                line,
-            );
-        }
-    }
-}
-
-/// Preview-style toolbar group separator: airy whitespace with a hairline,
-/// theme-aware (light black wash / dark white wash) instead of egui's chunky default.
-fn toolbar_sep(ui: &mut egui::Ui) {
-    ui.add_space(6.0);
-    let h = ui.spacing().interact_size.y;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let col = if ui.visuals().dark_mode {
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20)
-        };
-        ui.painter().rect_filled(rect, 0.0, col);
-    }
-    ui.add_space(6.0);
-}
-
-/// Paint a toolbar icon: Lucide texture when loaded (white glyph, theme-tinted),
-/// otherwise the optional hand-drawn vector fallback. Square-fit so wide buttons
-/// don't stretch it. Textures are compile-time embedded, so `None` never fires.
-fn icon_paint(
-    tex: Option<egui::TextureId>,
-    fallback: Option<fn(&egui::Painter, egui::Rect, egui::Color32)>,
-) -> impl FnOnce(&egui::Painter, egui::Rect, egui::Color32) {
-    move |painter, rect, color| match tex {
-        Some(id) => {
-            let side = rect.width().min(rect.height());
-            let sq = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
-            painter.image(
-                id,
-                sq,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                color,
-            );
-        }
-        None => {
-            if let Some(f) = fallback {
-                f(painter, rect, color);
-            }
-        }
-    }
-}
-
-/// Draw a left-pointing chevron (‹).
-fn paint_chevron_left(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let h = rect.height() * 0.32;
-    let w = h * 0.6;
-    let stroke = egui::Stroke::new(1.8, color);
-    painter.line_segment(
-        [egui::pos2(cx + w, cy - h), egui::pos2(cx - w * 0.2, cy)],
-        stroke,
-    );
-    painter.line_segment(
-        [egui::pos2(cx - w * 0.2, cy), egui::pos2(cx + w, cy + h)],
-        stroke,
-    );
-}
-
-/// Draw a right-pointing chevron (›).
-fn paint_chevron_right(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let h = rect.height() * 0.32;
-    let w = h * 0.6;
-    let stroke = egui::Stroke::new(1.8, color);
-    painter.line_segment(
-        [egui::pos2(cx - w, cy - h), egui::pos2(cx + w * 0.2, cy)],
-        stroke,
-    );
-    painter.line_segment(
-        [egui::pos2(cx + w * 0.2, cy), egui::pos2(cx - w, cy + h)],
-        stroke,
-    );
-}
-
-/// Draw a minus (−) icon.
-fn paint_minus(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let w = rect.width() * 0.28;
-    painter.line_segment(
-        [egui::pos2(cx - w, cy), egui::pos2(cx + w, cy)],
-        egui::Stroke::new(1.8, color),
-    );
-}
-
-/// Draw a plus (+) icon.
-fn paint_plus(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let w = rect.width() * 0.28;
-    painter.line_segment(
-        [egui::pos2(cx - w, cy), egui::pos2(cx + w, cy)],
-        egui::Stroke::new(1.8, color),
-    );
-    painter.line_segment(
-        [egui::pos2(cx, cy - w), egui::pos2(cx, cy + w)],
-        egui::Stroke::new(1.8, color),
-    );
-}
-
-/// Draw a sidebar-toggle icon (three lines + vertical divider).
-fn paint_sidebar_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let w = rect.width() * 0.30;
-    let dh = rect.height() * 0.18;
-    let stroke = egui::Stroke::new(1.5, color);
-    for dy in [-dh, 0.0_f32, dh] {
-        painter.line_segment(
-            [egui::pos2(cx - w, cy + dy), egui::pos2(cx + w, cy + dy)],
-            stroke,
-        );
-    }
-    painter.line_segment(
-        [
-            egui::pos2(cx - w * 0.3, cy - dh * 1.6),
-            egui::pos2(cx - w * 0.3, cy + dh * 1.6),
-        ],
-        stroke,
-    );
-}
-
-/// Draw a sun icon (light mode).
-fn paint_sun(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let r = rect.height() * 0.14;
-    let ray = rect.height() * 0.25;
-    let stroke = egui::Stroke::new(1.5, color);
-    painter.circle_stroke(egui::pos2(cx, cy), r, stroke);
-    for i in 0..8_i32 {
-        let angle = i as f32 * std::f32::consts::TAU / 8.0;
-        let (s, c2) = angle.sin_cos();
-        let inner = r + 2.0;
-        painter.line_segment(
-            [
-                egui::pos2(cx + c2 * inner, cy + s * inner),
-                egui::pos2(cx + c2 * ray, cy + s * ray),
-            ],
-            stroke,
-        );
-    }
-}
-
-/// Draw a crescent moon icon (dark mode).
-fn paint_moon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let r = rect.height() * 0.22;
-    let stroke = egui::Stroke::new(1.5, color);
-    // outer arc
-    let outer: Vec<egui::Pos2> = (0..=20)
-        .map(|i| {
-            let a = std::f32::consts::PI * 0.6 + i as f32 * std::f32::consts::PI / 20.0;
-            egui::pos2(cx + a.cos() * r, cy + a.sin() * r)
-        })
-        .collect();
-    for w in outer.windows(2) {
-        painter.line_segment([w[0], w[1]], stroke);
-    }
-    // inner arc (cutout)
-    let offset_x = r * 0.35;
-    let inner_r = r * 0.82;
-    let inner: Vec<egui::Pos2> = (0..=18)
-        .map(|i| {
-            let a = std::f32::consts::PI * 0.62 + i as f32 * std::f32::consts::PI * 0.96 / 18.0;
-            egui::pos2(cx + offset_x + a.cos() * inner_r, cy + a.sin() * inner_r)
-        })
-        .collect();
-    for w in inner.windows(2) {
-        painter.line_segment([w[0], w[1]], stroke);
-    }
-    if let (Some(&p1), Some(&p2)) = (outer.first(), inner.first()) {
-        painter.line_segment([p1, p2], stroke);
-    }
-    if let (Some(&p1), Some(&p2)) = (outer.last(), inner.last()) {
-        painter.line_segment([p1, p2], stroke);
-    }
-}
-
-#[cfg(windows)]
-#[link(name = "shell32")]
-extern "system" {
-    fn ShellExecuteW(
-        hwnd: isize,
-        lpoperation: *const u16,
-        lpfile: *const u16,
-        lpparameters: *const u16,
-        lpdirectory: *const u16,
-        nshowcmd: i32,
-    ) -> isize;
-    fn SHOpenWithDialog(hwnd: isize, info: *const OPENASINFO) -> i32;
-}
-
-// ---- COM init + OPENASINFO for the "Open with" picker ----
-
-#[cfg(windows)]
-#[link(name = "ole32")]
-extern "system" {
-    fn CoInitializeEx(reserved: *const std::ffi::c_void, coinit: u32) -> i32;
-    fn CoUninitialize();
-}
-
-#[cfg(windows)]
-const OAIF_ALLOW_REGISTRATION: u32 = 0x00000001;
-#[cfg(windows)]
-const OAIF_EXEC: u32 = 0x00000004;
-
-#[cfg(windows)]
-#[repr(C)]
-struct OPENASINFO {
-    psz_file: *const u16,
-    psz_class: *const u16,
-    flags: u32,
-}
-
-// ---- GDI printing: PrintDlg + StartDoc/StartPage/StretchDIBits ----
-
-#[cfg(windows)]
-#[link(name = "comdlg32")]
-extern "system" {
-    fn PrintDlgW(pd: *mut PRINTDLGW) -> i32;
-    fn CommDlgExtendedError() -> u32;
-}
-
-#[cfg(windows)]
-#[link(name = "gdi32")]
-extern "system" {
-    fn StartDocW(hdc: isize, docinfo: *const DOCINFOW) -> i32;
-    fn StartPage(hdc: isize) -> i32;
-    fn EndPage(hdc: isize) -> i32;
-    fn EndDoc(hdc: isize) -> i32;
-    fn StretchDIBits(
-        hdc: isize,
-        xdest: i32,
-        ydest: i32,
-        wdest: i32,
-        hdest: i32,
-        xsrc: i32,
-        ysrc: i32,
-        wsrc: i32,
-        hsrc: i32,
-        bits: *const u8,
-        info: *const BITMAPINFO,
-        usage: u32,
-        rop: u32,
-    ) -> i32;
-    fn DeleteDC(hdc: isize) -> i32;
-    fn GetDeviceCaps(hdc: isize, index: i32) -> i32;
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn GlobalFree(hmem: isize) -> isize;
-}
-
-#[cfg(windows)]
-const PD_PAGENUMS: u32 = 0x00000002;
-#[cfg(windows)]
-const PD_NOSELECTION: u32 = 0x00000004;
-#[cfg(windows)]
-const PD_RETURNDC: u32 = 0x00000100;
-#[cfg(windows)]
-const PD_NOWARNING: u32 = 0x00000080;
-#[cfg(windows)]
-const HORZRES: i32 = 8;
-#[cfg(windows)]
-const VERTRES: i32 = 10;
-#[cfg(windows)]
-const SRCCOPY: u32 = 0x00CC0020;
-#[cfg(windows)]
-const DIB_RGB_COLORS: u32 = 0;
-
-#[cfg(windows)]
-#[repr(C)]
-struct PRINTDLGW {
-    l_struct_size: u32,
-    hwnd_owner: isize,
-    h_dev_mode: isize,
-    h_dev_names: isize,
-    hdc: isize,
-    flags: u32,
-    n_from_page: u16,
-    n_to_page: u16,
-    n_min_page: u16,
-    n_max_page: u16,
-    n_copies: u16,
-    h_instance: isize,
-    l_cust_data: isize,
-    lpfn_print_hook: *const std::ffi::c_void,
-    lpfn_setup_hook: *const std::ffi::c_void,
-    lp_print_template_name: *const u16,
-    lp_setup_template_name: *const u16,
-    h_print_template: isize,
-    h_setup_template: isize,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct DOCINFOW {
-    cb_size: i32,
-    doc_name: *const u16,
-    output: *const u16,
-    datatype: *const u16,
-    fw_type: u32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct BITMAPINFOHEADER {
-    bi_size: u32,
-    bi_width: i32,
-    bi_height: i32,
-    bi_planes: u16,
-    bi_bit_count: u16,
-    bi_compression: u32,
-    bi_size_image: u32,
-    bi_x_pels_per_meter: i32,
-    bi_y_pels_per_meter: i32,
-    bi_clr_used: u32,
-    bi_clr_important: u32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct BITMAPINFO {
-    header: BITMAPINFOHEADER,
-}
-
-/// Result of the modal PrintDlg: the printer DC + what to print.
-struct PrintDialogResult {
-    hdc: isize,
-    h_dev_mode: isize,
-    h_dev_names: isize,
-    pages: Vec<i32>,
-    copies: usize,
-    printer_w: i32,
-    printer_h: i32,
-}
-
-/// Show the standard Print dialog on a dedicated STA thread.
-/// PrintDlgW requires the calling thread to be in a Single-Threaded Apartment;
-/// winit/egui initialise the main thread as MTA on modern Windows, so we spin
-/// up our own STA thread (the same pattern used for SHOpenWithDialog).
-/// The thread is joined synchronously so the egui frame stays paused.
-#[cfg(windows)]
-fn show_print_dialog(total_pages: i32) -> Result<PrintDialogResult, String> {
-    let total = total_pages.max(1);
-    let handle = std::thread::Builder::new()
-        .name("minipdf-printdlg".into())
-        .spawn(move || unsafe { show_print_dialog_impl(total) })
-        .map_err(|e| format!("spawn failed: {e}"))?;
-    handle
-        .join()
-        .map_err(|_| "print dialog thread panicked".to_owned())?
-}
-
-#[cfg(windows)]
-unsafe fn show_print_dialog_impl(total_pages: i32) -> Result<PrintDialogResult, String> {
-    // Initialise this thread as a Single-Threaded Apartment so that
-    // PrintDlgW (and its internal COM usage) works correctly.
-    const COINIT_APARTMENTTHREADED: u32 = 0x2;
-    let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
-
-    let mut pd: PRINTDLGW = std::mem::zeroed();
-    pd.l_struct_size = std::mem::size_of::<PRINTDLGW>() as u32;
-    // PD_NOWARNING: don't pop a message box if there's no default printer.
-    // PD_PAGENUMS is omitted from the initial flags so the dialog opens with
-    // "All pages" selected — the user can switch to a range in the dialog.
-    // If they do pick a range, pd.flags will have PD_PAGENUMS set on return.
-    pd.flags = PD_RETURNDC | PD_NOSELECTION | PD_NOWARNING;
-    pd.n_min_page = 1;
-    pd.n_max_page = total_pages.min(65535) as u16;
-    pd.n_from_page = 1;
-    pd.n_to_page = total_pages.min(65535) as u16;
-
-    let ok = PrintDlgW(&mut pd);
-    if ok == 0 {
-        let cderr = CommDlgExtendedError();
-        log_line(&format!(
-            "PrintDlgW failed: CommDlgExtendedError=0x{:08X}",
-            cderr
-        ));
-        if pd.hdc != 0 {
-            DeleteDC(pd.hdc);
-        }
-        if pd.h_dev_mode != 0 {
-            GlobalFree(pd.h_dev_mode);
-        }
-        if pd.h_dev_names != 0 {
-            GlobalFree(pd.h_dev_names);
-        }
-        return Err(if cderr == 0 {
-            "Print cancelled".to_owned()
-        } else {
-            format!("Print dialog error 0x{:08X}", cderr)
-        });
-    }
-
-    let pages: Vec<i32> = if pd.flags & PD_PAGENUMS != 0 && pd.n_from_page > 0 && pd.n_to_page > 0 {
-        let from = (pd.n_from_page as i32 - 1).max(0);
-        let to = (pd.n_to_page as i32 - 1).min(total_pages - 1);
-        (from..=to).collect()
-    } else {
-        (0..total_pages).collect()
-    };
-
-    if pages.is_empty() || pd.hdc == 0 {
-        if pd.hdc != 0 {
-            DeleteDC(pd.hdc);
-        }
-        if pd.h_dev_mode != 0 {
-            GlobalFree(pd.h_dev_mode);
-        }
-        if pd.h_dev_names != 0 {
-            GlobalFree(pd.h_dev_names);
-        }
-        return Err("No pages to print".to_owned());
-    }
-
-    let copies = pd.n_copies.max(1) as usize;
-    let printer_w = GetDeviceCaps(pd.hdc, HORZRES);
-    let printer_h = GetDeviceCaps(pd.hdc, VERTRES);
-
-    Ok(PrintDialogResult {
-        hdc: pd.hdc,
-        h_dev_mode: pd.h_dev_mode,
-        h_dev_names: pd.h_dev_names,
-        pages,
-        copies,
-        printer_w,
-        printer_h,
-    })
-}
-
-#[cfg(not(windows))]
-fn show_print_dialog(_total_pages: i32) -> Result<PrintDialogResult, String> {
-    Err("Printing is not supported on this platform".to_owned())
-}
-
-/// Run a shell verb ("print" / "open") on a file via ShellExecuteW.
-/// Returns Ok on success (return value > 32), Err with a readable reason otherwise.
-#[cfg(windows)]
-fn shell_verb(path: &Path, verb: &str) -> Result<(), String> {
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-    let op = wide(verb);
-    let file = wide(&path.to_string_lossy());
-    // SAFETY: ShellExecuteW only reads the given strings during the call.
-    let ret = unsafe {
-        ShellExecuteW(
-            0,
-            op.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1, // SW_SHOWNORMAL
-        )
-    };
-    if ret > 32 {
-        Ok(())
-    } else {
-        Err(match ret as i32 {
-            0 | 8 => "Out of memory".to_owned(),
-            2 => "File not found".to_owned(),
-            3 => "Path not found".to_owned(),
-            5 => "Access denied".to_owned(),
-            11 => "Bad file format".to_owned(),
-            27 => "File association is incomplete".to_owned(),
-            29 => "Print handler failed".to_owned(),
-            30 => "Print handler is busy".to_owned(),
-            31 => "No app handles this file (set a default PDF reader)".to_owned(),
-            32 => "Required DLL not found".to_owned(),
-            c => format!("System error {c}"),
-        })
-    }
-}
-
-#[cfg(not(windows))]
-fn shell_verb(_path: &Path, _verb: &str) -> Result<(), String> {
-    Err("One-click print is not supported on this platform".to_owned())
-}
-
-/// Raise the "How do you want to open this file?" picker via SHOpenWithDialog.
-/// Runs on a dedicated STA thread so the modal dialog has its own message pump
-/// without re-entering the egui loop.
-#[cfg(windows)]
-fn shell_openas_com(path: &Path) -> Result<(), String> {
-    let path = path.to_string_lossy().to_string();
-    let handle = std::thread::Builder::new()
-        .name("minipdf-openas".into())
-        .spawn(move || unsafe { shell_openas_com_impl(&path) })
-        .map_err(|e| format!("spawn failed: {e}"))?;
-    // the picker is modal; block until it closes (bounded by the user)
-    handle
-        .join()
-        .map_err(|_| "openas thread panicked".to_owned())?
-}
-
-#[cfg(windows)]
-unsafe fn shell_openas_com_impl(path: &str) -> Result<(), String> {
-    // STA so the modal "Open with" dialog has a working message pump.
-    const COINIT_APARTMENTTHREADED: u32 = 0x2;
-    let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
-
-    let file_w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    let info = OPENASINFO {
-        psz_file: file_w.as_ptr(),
-        psz_class: std::ptr::null(),
-        flags: OAIF_ALLOW_REGISTRATION | OAIF_EXEC,
-    };
-    let hr = SHOpenWithDialog(0, &info);
-    CoUninitialize();
-
-    if hr >= 0 {
-        Ok(())
-    } else {
-        Err(format!("SHOpenWithDialog failed: 0x{:08X}", hr as u32))
-    }
-}
-
-#[cfg(not(windows))]
-fn shell_openas_com(_path: &Path) -> Result<(), String> {
-    Err("Not supported on this platform".to_owned())
-}
-
-// ---------- text selection ----------
-
-#[derive(Clone, Copy)]
-struct CharInfo {
-    ch: char,
-    left: f32,
-    bottom: f32,
-    right: f32,
-    top: f32,
-}
-
-impl CharInfo {
-    fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.left && x <= self.right && y >= self.bottom && y <= self.top
-    }
-    fn center(&self) -> (f32, f32) {
-        (
-            (self.left + self.right) * 0.5,
-            (self.bottom + self.top) * 0.5,
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-struct TextSelection {
-    page: i32,
-    start: usize,
-    end: usize, // inclusive, normalized start <= end
-}
-
-impl TextSelection {
-    fn new(page: i32, a: usize, b: usize) -> Self {
-        Self {
-            page,
-            start: a.min(b),
-            end: a.max(b),
-        }
-    }
-    fn len(&self) -> usize {
-        self.end.saturating_sub(self.start) + 1
-    }
-}
-
-// pdf point -> screen rect inside an image rect
-fn pdf_rect_to_screen_raw(
-    left: f32,
-    bottom: f32,
-    right: f32,
-    top: f32,
-    img: &egui::Rect,
-    pw: f32,
-    ph: f32,
-) -> Option<egui::Rect> {
-    if pw <= 0.0 || ph <= 0.0 {
-        return None;
-    }
-    let sx = img.width() / pw;
-    let sy = img.height() / ph;
-    let x0 = img.min.x + left * sx;
-    let x1 = img.min.x + right * sx;
-    // pdf y is bottom-up, screen y is top-down
-    let y0 = img.max.y - top * sy;
-    let y1 = img.max.y - bottom * sy;
-    Some(egui::Rect::from_min_max(
-        egui::pos2(x0.min(x1), y0.min(y1)),
-        egui::pos2(x0.max(x1), y0.max(y1)),
-    ))
-}
-
-fn pdf_rect_to_screen(c: &CharInfo, img: &egui::Rect, pw: f32, ph: f32) -> Option<egui::Rect> {
-    pdf_rect_to_screen_raw(c.left, c.bottom, c.right, c.top, img, pw, ph)
-}
-
-fn rect_pt(l: f32, b: f32, r: f32, t: f32) -> PdfRect {
-    PdfRect::new(
-        PdfPoints::new(b),
-        PdfPoints::new(l),
-        PdfPoints::new(t),
-        PdfPoints::new(r),
-    )
-}
-
-/// Merge char boxes into per-line boxes (left, bottom, right, top).
-/// Sorts by vertical centre first so the merge scan is a single O(n) pass.
-fn merge_lines(rects: &[(f32, f32, f32, f32)]) -> Vec<(f32, f32, f32, f32)> {
-    if rects.is_empty() {
-        return Vec::new();
-    }
-    // sort by y-centre ascending (top of page first in PDF coords)
-    let mut sorted: Vec<(f32, f32, f32, f32)> = rects.to_vec();
-    sorted.sort_unstable_by(|a, b| {
-        let ya = (a.1 + a.3) * 0.5;
-        let yb = (b.1 + b.3) * 0.5;
-        ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut lines: Vec<(f32, f32, f32, f32)> = Vec::new();
-    for (l, b, r, t) in sorted {
-        let yc = (b + t) * 0.5;
-        let h = (t - b).max(0.5);
-        if let Some(last) = lines.last_mut() {
-            let lyc = (last.1 + last.3) * 0.5;
-            let lh = (last.3 - last.1).max(0.5);
-            if (yc - lyc).abs() < 0.4 * lh.max(h) {
-                last.0 = last.0.min(l);
-                last.1 = last.1.min(b);
-                last.2 = last.2.max(r);
-                last.3 = last.3.max(t);
-                continue;
-            }
-        }
-        lines.push((l, b, r, t));
-    }
-    lines
-}
-
-fn screen_to_pdf(pos: egui::Pos2, img: &egui::Rect, pw: f32, ph: f32) -> Option<(f32, f32)> {
-    if pw <= 0.0 || ph <= 0.0 || img.width() <= 0.0 || img.height() <= 0.0 {
-        return None;
-    }
-    let x = (pos.x - img.min.x) / img.width() * pw;
-    let y = (img.max.y - pos.y) / img.height() * ph;
-    Some((x, y))
-}
-
-/// 1:1 lowercase mapping so search indices stay aligned with char indices.
-fn lower1(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
-fn pick_char(chars: &[CharInfo], x: f32, y: f32) -> Option<usize> {
-    // 1. direct hit
-    for (i, c) in chars.iter().enumerate() {
-        if c.contains(x, y) {
-            return Some(i);
-        }
-    }
-    // 2. nearest center within a tolerance (half of char size + slack)
-    let mut best: Option<(usize, f32)> = None;
-    for (i, c) in chars.iter().enumerate() {
-        let (cx, cy) = c.center();
-        let w = (c.right - c.left).max(1.0);
-        let h = (c.top - c.bottom).max(1.0);
-        let dx = (x - cx) / w;
-        let dy = (y - cy) / h;
-        let d = dx * dx + dy * dy;
-        if d < 4.0 {
-            match best {
-                Some((_, bd)) if bd <= d => {}
-                _ => best = Some((i, d)),
-            }
-        }
-    }
-    best.map(|(i, _)| i)
-}
-
-/// Text markup kind (mirrors Preview: highlight / underline / strike out).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MarkupKind {
-    Highlight,
-    Underline,
-    Strikeout,
-}
-
-impl MarkupKind {
-    fn name(self) -> &'static str {
-        match self {
-            MarkupKind::Highlight => "Highlight",
-            MarkupKind::Underline => "Underline",
-            MarkupKind::Strikeout => "Strikethrough",
-        }
-    }
-}
-
-/// Highlight color choices (Preview offers yellow/green/blue/pink).
-const HIGHLIGHT_COLORS: &[(&str, (u8, u8, u8))] = &[
-    ("Yellow", (255, 255, 0)),
-    ("Green", (146, 208, 80)),
-    ("Blue", (155, 194, 230)),
-    ("Pink", (255, 153, 204)),
-];
-
-/// One 90° rotation step (Preview: rotate left / right).
-fn step_rotation(cur: PdfPageRenderRotation, left: bool) -> PdfPageRenderRotation {
-    use PdfPageRenderRotation as R;
-    match (cur, left) {
-        (R::None, true) => R::Degrees270,
-        (R::None, false) => R::Degrees90,
-        (R::Degrees90, true) => R::None,
-        (R::Degrees90, false) => R::Degrees180,
-        (R::Degrees180, true) => R::Degrees90,
-        (R::Degrees180, false) => R::Degrees270,
-        (R::Degrees270, true) => R::Degrees180,
-        (R::Degrees270, false) => R::None,
-    }
-}
-
-/// Pending sticky-note creation (Preview: note).
-/// Position is in PDF points; the text is collected via a small dialog.
-struct NoteDraft {
-    tab: usize,
-    page: i32,
-    x: f32,
-    y: f32,
-    text: String,
-    fresh: bool, // first frame: grab keyboard focus
-}
-
-// ---------- tabs ----------
-
-/// Clickable link on a page: bounds in PDF points + target.
-#[derive(Clone)]
-enum LinkTarget {
-    Url(String),
-    Page(i32),
-}
-
-#[derive(Clone)]
-struct PageLink {
-    left: f32,
-    bottom: f32,
-    right: f32,
-    top: f32,
-    target: LinkTarget,
-}
-
-impl PageLink {
-    fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.left && x <= self.right && y >= self.bottom && y <= self.top
-    }
-    fn label(&self) -> String {
-        match &self.target {
-            LinkTarget::Url(u) => u.clone(),
-            LinkTarget::Page(p) => format!("Go to page {}", p + 1),
-        }
-    }
-}
-
-/// One occurrence of the search query: char range [start, end] on a page.
-#[derive(Clone, Copy)]
-struct SearchMatch {
-    page: i32,
-    start: usize,
-    end: usize, // inclusive
-}
-
-/// One embedded raster image on a page: object index + PDF-space bounds.
-#[derive(Clone)]
-struct PdfImage {
-    obj: usize, // index into page.objects()
-    left: f32,
-    bottom: f32,
-    right: f32,
-    top: f32,
-}
-
-impl PdfImage {
-    fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.left && x <= self.right && y >= self.bottom && y <= self.top
-    }
-    fn area(&self) -> f32 {
-        (self.right - self.left) * (self.top - self.bottom)
-    }
-}
-
-struct DocTab {
-    version: DocVersion,
-    search_generation: u64,
-    search_cancel: Arc<AtomicBool>,
-    search_snippets: Vec<String>,
-    path: PathBuf,
-    pages: i32,
-    cur: i32,
-    zoom: f32,
-    aspects: HashMap<i32, (f32, f32)>,
-    scroll_target: Option<i32>,
-    scroll_to_match: bool, // jump was triggered by search: center the match, not the page
-    page_tex: HashMap<(i32, u32), egui::TextureHandle>,
-    thumb_tex: HashMap<i32, egui::TextureHandle>,
-    search_text: String,
-    search_query: String,             // last executed query (1:1-lowercased)
-    search_matches: Vec<SearchMatch>, // every occurrence, ordered by page
-    search_by_page: HashMap<i32, Vec<usize>>, // page -> indices into search_matches
-    search_cursor: usize,             // index into search_matches
-    search_hits: Vec<i32>,            // pages containing matches (thumbnail badges)
-    text_cache: HashMap<i32, Vec<CharInfo>>,
-    link_cache: HashMap<i32, Vec<PageLink>>,
-    image_cache: HashMap<i32, Vec<PdfImage>>, // embedded raster images, for copy/save-as
-    outline: Option<Vec<OutlineItem>>,        // document outline, lazy (None = not fetched yet)
-    notes: Option<Vec<NoteItem>>,             // annotations list, lazy (None = not fetched yet)
-    selection: Option<TextSelection>,
-    highlight_rgb: (u8, u8, u8),
-    markup_stack: Vec<MarkupUndo>,
-    drag_anchor: Option<(i32, usize)>,
-    page_box: String,  // toolbar page-number field (committed with Enter)
-    page_box_cur: i32, // which `cur` the field currently reflects (-1 = needs sync)
-    // image pinned for the open context menu (page, object). The menu floats
-    // above the page, so hover no longer hits the image while it is open.
-    context_image: Option<(i32, PdfImage)>,
-    // right-click position pinned for the open context menu (page, x, y in
-    // PDF points). interact_pointer_pos() goes stale once the pointer moves
-    // onto the floating menu, so the position is captured at click time.
-    context_point: Option<(i32, f32, f32)>,
-}
-
-impl DocTab {
-    fn new(path: PathBuf, pages: i32, aspects: HashMap<i32, (f32, f32)>) -> Self {
-        static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
-        Self {
-            version: DocVersion {
-                id: TabId(NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed)),
-                revision: 0,
-            },
-            search_generation: 0,
-            search_cancel: Arc::new(AtomicBool::new(false)),
-            search_snippets: Vec::new(),
-            path,
-            pages,
-            cur: 0,
-            zoom: 1.0,
-            aspects,
-            scroll_target: None,
-            scroll_to_match: false,
-            page_tex: HashMap::new(),
-            thumb_tex: HashMap::new(),
-            search_text: String::new(),
-            search_query: String::new(),
-            search_matches: Vec::new(),
-            search_by_page: HashMap::new(),
-            search_cursor: 0,
-            search_hits: Vec::new(),
-            text_cache: HashMap::new(),
-            link_cache: HashMap::new(),
-            image_cache: HashMap::new(),
-            outline: None,
-            notes: None,
-            highlight_rgb: (255, 255, 0),
-            markup_stack: Vec::new(),
-            selection: None,
-            drag_anchor: None,
-            page_box: String::new(),
-            page_box_cur: -1,
-            context_image: None,
-            context_point: None,
-        }
-    }
-
-    fn title(&self) -> String {
-        self.path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
-    }
-
-    /// Drop page textures for pages far from the current one, keeping at most
-    /// `MAX_PAGE_TEX_PAGES`. Zoom changes only evict *stale* widths (wrong zoom
-    /// level) so scrolling back reuses what was already rendered.
-    fn evict_page_tex(&mut self) {
-        if self.page_tex.len() <= MAX_PAGE_TEX_PAGES * 2 {
-            return;
-        }
-        let cur = self.cur;
-        // rank pages by distance to the current page; keep the nearest ones
-        let mut dists: Vec<(i32, i32)> = self
-            .page_tex
-            .keys()
-            .map(|(p, _)| ((p - cur).abs(), *p))
-            .collect();
-        dists.sort_unstable();
-        let keep: std::collections::HashSet<i32> = dists
-            .into_iter()
-            .take(MAX_PAGE_TEX_PAGES)
-            .map(|(_, p)| p)
-            .collect();
-        self.page_tex.retain(|(p, _), _| keep.contains(p));
-    }
-
-    /// Same bound for the per-page text/link/image layer caches.
-    fn evict_layers(&mut self) {
-        fn prune<V>(map: &mut HashMap<i32, V>, cur: i32) {
-            if map.len() <= MAX_LAYER_PAGES {
-                return;
-            }
-            let mut dists: Vec<i32> = map.keys().cloned().collect();
-            dists.sort_unstable_by_key(|p| (p - cur).abs());
-            let keep: std::collections::HashSet<i32> =
-                dists.into_iter().take(MAX_LAYER_PAGES).collect();
-            map.retain(|p, _| keep.contains(p));
-        }
-        let cur = self.cur;
-        prune(&mut self.text_cache, cur);
-        prune(&mut self.link_cache, cur);
-        prune(&mut self.image_cache, cur);
-    }
-
-    /// Remove all page textures whose render width doesn't match `current_width`.
-    /// Called on zoom change so stale-zoom textures are freed immediately.
-    fn evict_stale_zoom(&mut self, current_width: u32) {
-        self.page_tex.retain(|(_, w), _| *w == current_width);
-    }
-
-    fn selection_text(&self) -> Option<String> {
-        let sel = self.selection?;
-        let chars = self.text_cache.get(&sel.page)?;
-        if chars.is_empty() || sel.end >= chars.len() {
-            return None;
-        }
-        Some(chars[sel.start..=sel.end].iter().map(|c| c.ch).collect())
-    }
 }
 
 // ---------- app ----------
@@ -1926,7 +667,7 @@ impl MiniPdf {
             Some(t) => t.path.clone(),
             None => return,
         };
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
             let pages = document.pages();
@@ -1940,7 +681,7 @@ impl MiniPdf {
             Ok(())
         });
         match r {
-            Ok(()) => match std::fs::rename(&tmp, &path) {
+            Ok(()) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         tab.notes = None;
@@ -1968,7 +709,7 @@ impl MiniPdf {
             Some(t) => t.path.clone(),
             None => return,
         };
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
             let pages = document.pages();
@@ -1979,7 +720,7 @@ impl MiniPdf {
             Ok(())
         });
         match r {
-            Ok(()) => match std::fs::rename(&tmp, &path) {
+            Ok(()) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         // Rotation changes the page's display geometry: drop its
@@ -2028,7 +769,7 @@ impl MiniPdf {
         if page < 0 || page >= count {
             return;
         }
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
             let pages = document.pages();
@@ -2037,7 +778,7 @@ impl MiniPdf {
             Ok(pages.len())
         });
         match r {
-            Ok(new_len) => match std::fs::rename(&tmp, &path) {
+            Ok(new_len) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         tab.pages = new_len;
@@ -2111,7 +852,7 @@ impl MiniPdf {
         } else {
             None
         };
-        let tmp = dest.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&dest);
         let src_name = src
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -2131,7 +872,7 @@ impl MiniPdf {
             Ok((before, after))
         });
         match r {
-            Ok((before, after)) => match std::fs::rename(&tmp, &dest) {
+            Ok((before, after)) => match atomic_replace_file(&tmp, &dest) {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         tab.pages = after;
@@ -2425,7 +1166,7 @@ impl MiniPdf {
                     if let Some(local) = act.as_local_destination_action() {
                         if let Ok(dest) = local.destination() {
                             if let Ok(p) = dest.page_index() {
-                                page_idx = Some(p as i32);
+                                page_idx = Some(p);
                             }
                         }
                     }
@@ -2433,7 +1174,7 @@ impl MiniPdf {
                 if page_idx.is_none() {
                     if let Some(dest) = link.destination() {
                         if let Ok(p) = dest.page_index() {
-                            page_idx = Some(p as i32);
+                            page_idx = Some(p);
                         }
                     }
                 }
@@ -2507,11 +1248,8 @@ impl MiniPdf {
             };
             let img = img_obj.get_raw_image()?;
             let rgba = img.to_rgba8();
-            Ok((
-                rgba.as_raw().clone(),
-                rgba.width() as usize,
-                rgba.height() as usize,
-            ))
+            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            Ok((rgba.into_raw(), w, h))
         });
         match res {
             Ok((data, w, h)) => {
@@ -2531,8 +1269,8 @@ impl MiniPdf {
 
     /// Copy an embedded image to the system clipboard as PNG (Windows CF_DIB via arboard).
     fn copy_image(&mut self, tab_idx: usize, page: i32, img: &PdfImage) {
-        match self.extract_image(tab_idx, page, img.obj) {
-            Ok((data, w, h)) => match arboard::Clipboard::new() {
+        if let Ok((data, w, h)) = self.extract_image(tab_idx, page, img.obj) {
+            match arboard::Clipboard::new() {
                 Ok(mut cb) => {
                     let imd = arboard::ImageData {
                         width: w,
@@ -2548,9 +1286,8 @@ impl MiniPdf {
                     }
                 }
                 Err(e) => self.status = format!("Clipboard unavailable: {e}"),
-            },
-            Err(_) => {} // status already set by extract_image
-        }
+            }
+        } // status already set by extract_image on Err
     }
 
     /// Save an embedded image to a user-chosen file (PNG).
@@ -2766,14 +1503,14 @@ impl MiniPdf {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
             document.save_to_file(&tmp)?;
             Ok(())
         });
         match r {
-            Ok(()) => match std::fs::rename(&tmp, &path) {
+            Ok(()) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => self.status = format!("Saved {name}"),
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
@@ -2873,7 +1610,7 @@ impl MiniPdf {
             Some(t) => t.path.clone(),
             None => return,
         };
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
             let pages = document.pages();
@@ -2921,7 +1658,7 @@ impl MiniPdf {
             Ok((before_len, count))
         });
         match r {
-            Ok((before_len, count)) => match std::fs::rename(&tmp, &path) {
+            Ok((before_len, count)) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => {
                     if count == 0 {
                         self.status = "Nothing to mark up".to_owned();
@@ -2969,7 +1706,7 @@ impl MiniPdf {
             Some(t) => t.path.clone(),
             None => return,
         };
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
             let pages = document.pages();
@@ -2989,7 +1726,7 @@ impl MiniPdf {
             Ok(())
         });
         match r {
-            Ok(()) => match std::fs::rename(&tmp, &path) {
+            Ok(()) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         tab.markup_stack.pop();
@@ -3028,7 +1765,7 @@ impl MiniPdf {
             ),
             None => return,
         };
-        let tmp = path.with_extension("pdf.minipdf-tmp");
+        let tmp = unique_temp_pdf_path(&path);
         let text_owned = text.to_owned();
         let r = self.with_doc(tab_idx, |pdfium, p| {
             let document = pdfium.load_pdf_from_file(p, None)?;
@@ -3055,7 +1792,7 @@ impl MiniPdf {
             Ok(before_len)
         });
         match r {
-            Ok(before_len) => match std::fs::rename(&tmp, &path) {
+            Ok(before_len) => match atomic_replace_file(&tmp, &path) {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         tab.page_tex.retain(|(p, _), _| *p != page);
@@ -3377,7 +2114,7 @@ impl MiniPdf {
         }
 
         let page = job.pages[job.cur_idx];
-        let render_w = job.printer_w.max(200).min(4000);
+        let render_w = job.printer_w.clamp(200, 4000);
 
         let engine = match self.pdfium.as_ref() {
             Some(e) => e,
@@ -4245,9 +2982,8 @@ impl MiniPdf {
                 if let Some(tex) = tex {
                     let size = tex.size_vec2();
                     let h = w * size.y / size.x.max(1.0);
-                    let btn =
-                        egui::ImageButton::new(egui::Image::new((tex.id(), egui::vec2(w, h))))
-                            .selected(selected);
+                    let btn = egui::Button::image(egui::Image::new((tex.id(), egui::vec2(w, h))))
+                        .selected(selected);
                     let tresp = ui.add_sized([w + 8.0, h + 4.0], btn);
                     if tresp.clicked() {
                         self.goto(tab_idx, i);
@@ -5400,7 +4136,7 @@ impl eframe::App for MiniPdf {
         let dark = ui.visuals().dark_mode;
         let (toolbar_fill, sidebar_fill, status_fill) = preview_chrome(dark);
         if !fs {
-            let top_out = egui::TopBottomPanel::top("toolbar")
+            let top_out = egui::Panel::top("toolbar")
                 .frame(egui::Frame::side_top_panel(ui.style()).fill(toolbar_fill))
                 .show_inside(ui, |ui| {
                     ui.vertical(|ui| {
@@ -5413,7 +4149,7 @@ impl eframe::App for MiniPdf {
             paint_groove(ui, top_out.response.rect, 0);
         }
         if has_tabs && self.show_sidebar && !fs {
-            let side_out = egui::SidePanel::left("sidebar")
+            let side_out = egui::Panel::left("sidebar")
                 .resizable(true)
                 .default_size(220.0)
                 .frame(egui::Frame::side_top_panel(ui.style()).fill(sidebar_fill))
@@ -5501,7 +4237,7 @@ impl eframe::App for MiniPdf {
             });
         }
         if !fs {
-            let bot_out = egui::TopBottomPanel::bottom("status")
+            let bot_out = egui::Panel::bottom("status")
                 .frame(egui::Frame::side_top_panel(ui.style()).fill(status_fill))
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
