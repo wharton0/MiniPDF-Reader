@@ -25,7 +25,7 @@ A minimal PDF viewer written in **Rust** using **Pdfium** and **egui**. Designed
 - Export: current page or all pages as PNG/JPEG (File → Export as image)
 - Undo/redo per tab for markup
 - Save (`Ctrl+S`) and Save As
-- Color scheme: forced light theme, Catalina v2 palette
+- Color scheme: light by default, dark mode toggle in the toolbar
 - Window controls: Close (#FF5F57), Minimize (#FFBD2E), Zoom (#28C840)
 
 ## Screenshot

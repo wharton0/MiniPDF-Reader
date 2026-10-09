@@ -8,9 +8,10 @@ A Windows-only minimal PDF viewer built in Rust with **Pdfium** (rendering) and 
 cargo build                 # debug build (uses build.rs to embed app icon via rc.exe if available)
 cargo build --release       # release build (opt-level 2, stripped)
 cargo run -- <file.pdf>     # launch viewer with one or more PDFs pre-opened as tabs
+cargo test                  # 19 unit tests (mod tests in src/main.rs: search, geometry, outline/notes, render)
 ```
 
-There is **no test suite, no linter config, no CI**. Verification is manual: build, launch, interact.
+There is **no linter config, no CI**. `cargo test` covers the pure helpers; full verification is still manual: build, launch, interact.
 
 ## Runtime prerequisites
 
@@ -27,28 +28,35 @@ There is **no test suite, no linter config, no CI**. Verification is manual: bui
 ### Module split
 
 - `src/lib.rs` — Pdfium binding + **custom font fallback provider** (`CjkFallbackProvider`).
-- `src/main.rs` — the entire GUI application (~3100 lines, one file). Everything below lives here.
+- `src/main.rs` — GUI application (~4800 lines incl. `mod tests`): `MiniPdf` app state, frame layout, and background-worker orchestration (`poll_*` channel drains each frame).
+- `src/types.rs` — domain types: `TabId`/`DocVersion`, channel message aliases (`RenderMessage`/`LayerMessage`/`SearchMessage`/`OutlineMessage`/`NotesMessage`), `DocTab` + cache eviction, `CharInfo`/`TextSelection`/`PageLink`/`PdfImage`/`SearchMatch`, `MarkupKind`/`MarkupUndo`, `OutlineItem`/`NoteItem`, persisted `AppStateFile`/`FilePlace`, cache-limit constants.
+- `src/theme.rs` — palettes (`preview_chrome`/`preview_canvas`/`preview_selection`/`preview_link` with real dark variants), groove/separator painting, toolbar `icon_paint` + hand-drawn vector icon fallbacks.
+- `src/search.rs` — `lower1`/`normalized_query`/`search_page` (cancellable, snippet-building).
+- `src/pdf_util.rs` — zoom/render constants, PDF↔screen coordinate mapping, rotation stepping, outline/notes fetching.
+- `src/platform.rs` — Windows FFI: print dialog + GDI printing, `shell_verb`, `shell_openas_com`, with `#[cfg(not(windows))]` stubs.
 
 ### Core types
 
-- `MiniPdf` (`eframe::App`) — top-level app state. Holds one shared `Pdfium` instance, a `Vec<DocTab>`, sidebar mode, status string, and preloaded UI icon textures.
+- `MiniPdf` (`eframe::App`) — top-level app state. Holds the shared `Pdfium` instance, a `Vec<DocTab>`, sidebar mode, status string, preloaded UI icon textures, and five mpsc channel pairs (`render`/`layer`/`search`/`outline`/`notes`) plus `render_in_flight`/`render_failed` sets that cap concurrent background renders (`MAX_RENDER_THREADS`).
 - `DocTab` — one open PDF: path, current page, zoom, page/aspect map, and **per-tab caches** keyed by page number:
   - `page_tex: HashMap<(i32, u32), TextureHandle>` — rendered page bitmaps keyed by `(page, width_px)`. Width is snapped to a zoom grid so re-visiting a zoom level reuses the texture.
   - `thumb_tex: HashMap<i32, TextureHandle>` — sidebar thumbnails.
   - `text_cache` / `link_cache` / `image_cache` — extracted text chars, hyperlinks, and embedded raster images per page.
-  - `search_matches` / `search_by_page` / `search_cursor` — search results.
-  - `markup_stack: Vec<i32>` — pages that received markup this session, for undo.
-- `CharInfo` / `TextSelection` / `PageLink` / `PdfImage` / `SearchMatch` — value types for page content layers.
+  - `outline: Option<Vec<OutlineItem>>` / `notes: Option<Vec<NoteItem>>` — bookmark tree and annotation list, fetched on background threads.
+  - `search_matches` / `search_by_page` / `search_hits` / `search_snippets` / `search_cursor` — search results.
+  - `markup_stack: Vec<MarkupUndo>` — undo records (`page` + `before_len` + `count`).
+  - `version: DocVersion` (stable `TabId` + revision) plus `search_generation` / `search_cancel` — guards so the frame loop drops stale background results.
+- `CharInfo` / `TextSelection` / `PageLink` (`LinkTarget::Url`/`Page`) / `PdfImage` / `SearchMatch` / `OutlineItem` / `NoteItem` — value types for page content layers.
 
 ### Data flow
 
 1. `main()` builds `MiniPdf`, preloads icon textures and the CJK UI font, hands off to `eframe::run_native`.
 2. Each frame: `eframe::App::ui` consumes keyboard shortcuts (Ctrl+O/W/S/P/F/C, F9/F11/Esc, Ctrl+Tab, F3), processes drag-and-dropped PDFs, then lays out the **tab bar → toolbar → sidebar → page view → status bar**.
-3. Page rendering goes through `MiniPdf::render_tex` which checks the texture cache, and on miss calls `with_doc` → `Pdfium::load_pdf_from_file` → `page.render_with_config` → `ColorImage` → `ctx.load_texture`.
+3. Page rendering goes through `MiniPdf::render_tex`: cache hit returns the texture, cache miss spawns a background worker (`spawn_worker("minipdf-render", …)`, capped by `MAX_RENDER_THREADS`, tracked in `render_in_flight`) and returns `None` so the UI shows a Loading placeholder. The worker opens the PDF itself (`ensure_pdfium` → `load_pdf_from_file` → `render_with_config` → RGBA bytes) and posts a `RenderMessage`; `poll_render` turns it into a `ColorImage` → `ctx.load_texture` on the next frame.
 
 ### Critical pattern: `with_doc`
 
-**Every** Pdfium operation (render, extract text, save, markup, search) goes through `MiniPdf::with_doc(tab_idx, |pdfium, path| ...)`. The closure re-opens the PDF from disk each call — `pdfium-render` does not keep a long-lived `PdfDocument` in app state. This is by design: a `PdfDocument` borrows the `Pdfium` bindings and would conflict with egui's borrow-checker across frames. The tradeoff is repeated file I/O; the texture/layer caches mask this.
+**Every** Pdfium operation (render, extract text, save, markup, search) goes through `MiniPdf::with_doc(tab_idx, |pdfium, path| ...)`. The closure re-opens the PDF from disk each call — `pdfium-render` does not keep a long-lived `PdfDocument` in app state. This is by design: a `PdfDocument` borrows the `Pdfium` bindings and would conflict with egui's borrow-checker across frames. The tradeoff is repeated file I/O; the texture/layer caches mask this. `with_doc` uses the shared `self.pdfium` handle; background workers (`spawn_worker`) instead call `ensure_pdfium()` themselves and post typed messages back over the channels.
 
 ### Caching strategy
 
@@ -66,14 +74,14 @@ Text markup (highlight / underline / strikeout) is implemented as **square annot
 
 ### Search
 
-`run_search` does a single document open, walks every page's text, and does case-insensitive substring matching using a **first-char-only lowercase** (`lower1`) to keep character indices aligned with the source text (full `to_lowercase` can change string length and break index mapping). Results are capped at 500/page and 5000 total.
+`run_search` bumps `search_generation`, swaps in a fresh cancellable `AtomicBool`, and walks every page's text on a background worker (`search::search_page`), posting a `SearchMessage`. Matching is case-insensitive via a **first-char-only lowercase** (`lower1`) to keep character indices aligned with the source text (full `to_lowercase` can change string length and break index mapping). Each hit also records a one-line snippet (`search_snippets`). `poll_search` applies results only if the generation still matches, so typing a new query discards the stale run. Results are capped at 500/page and 5000 total (`truncated` flag).
 
 ### Save / Save As
 
 - `save_now`: render to `.pdf.minipdf-tmp`, then `std::fs::rename` over the original (atomic on same volume).
 - `save_as`: write to chosen path, then switch the tab's `path` to the new file so subsequent saves target it.
 
-### Windows shell integration
+### Windows shell integration (`src/platform.rs`)
 
 - `shell_verb(path, "print")` / `"open"` — `ShellExecuteW` FFI for system print and default-app open.
 - `shell_openas_com(path)` — "Open with" picker via `SHOpenWithDialog` (shell32), run on a dedicated **STA thread** because the dialog is modal and needs its own message pump without re-entering the egui loop. The thread is joined (blocking) so the UI freezes until the user closes the dialog.
@@ -82,7 +90,7 @@ Text markup (highlight / underline / strikeout) is implemented as **square annot
 ## Conventions and gotchas
 
 - **Windows-only by design.** Non-Windows builds compile (via cfg stubs) but cannot render or print.
-- **Forced light theme.** The app hardcodes `egui::Visuals::light()` and a Catalina v2 gray palette — it never follows the OS dark mode. The color helpers (`preview_chrome`, `preview_canvas`, `preview_selection`, `preview_link`) take a `dark` param but the visuals are always light.
+- **Dark mode toggle, light by default.** `MiniPdf::dark_mode` (toolbar sun/moon button → `toggle_dark_mode`/`apply_theme`) switches between the Catalina v2 light palette and the real dark variants in `theme.rs` (`preview_chrome`, `preview_canvas`, `preview_selection`, `preview_link` all take a `dark` param). Groove/separator painting adapts via `ui.visuals().dark_mode`. It never follows the OS setting — it's a manual in-app switch.
 - **`#![windows_subsystem = "windows"]`** at the crate root — no console window on launch. This means `println!` output is invisible; use `log_line()` or `eprintln!` (only visible if launched from a terminal).
 - **Borrow checker workaround in event handling.** When a keyboard shortcut needs to call a `&mut self` method, the code often clones the `egui::Context` first (`let ctx = ui.ctx().clone()`) so the borrow on `ui` is released before the mutable call. Follow this pattern when adding new shortcuts that call `&mut self` methods.
 - **`eframe::App::ui` is used instead of `update`.** The app implements `fn ui(&mut self, ui: &mut egui::Ui, _frame)` rather than the standard `fn update(&mut self, ctx, frame)`. Layout is done with `Panel::top` / `SidePanel::left` / `TopBottomPanel::bottom` inside `ui`.
@@ -95,10 +103,10 @@ Text markup (highlight / underline / strikeout) is implemented as **square annot
 | Constant | Value | Purpose |
 |---|---|---|
 | `THUMB_WIDTH` | 132 | Sidebar thumbnail width in px |
-| `RENDER_BASE_WIDTH` | 1100 | Base render width at zoom 1.0 |
-| `MAX_RENDER_WIDTH` | 2600 | Hard cap on texture width (~38 MB RGBA per page) |
-| `MAX_PAGE_TEX_PAGES` | 16 | Max pages kept in the texture cache |
-| `MAX_LAYER_PAGES` | 32 | Max pages kept in text/link/image caches |
-| `ZOOM_STEP` | 0.05 | Zoom grid step (range 0.2–4.0) |
-| `MAX_MARK_CHARS` | 3000 | Max chars in a single markup annotation |
-| Search caps | 500/page, 5000 total | Hard limits on search results |
+| `RENDER_BASE_WIDTH` | 1100 | Base render width at zoom 1.0 (`pdf_util.rs`) |
+| `MAX_RENDER_WIDTH` | 2600 | Hard cap on texture width (~38 MB RGBA per page, `pdf_util.rs`) |
+| `MAX_PAGE_TEX_PAGES` | 16 | Max pages kept in the texture cache (`types.rs`) |
+| `MAX_LAYER_PAGES` | 32 | Max pages kept in text/link/image caches (`types.rs`) |
+| `ZOOM_STEP` | 0.05 | Zoom grid step (range 0.2–4.0, `pdf_util.rs`) |
+| `MAX_MARK_CHARS` | 3000 | Max chars in a single markup annotation (`main.rs::add_markup`) |
+| Search caps | 500/page, 5000 total | Hard limits on search results (`search.rs`) |
