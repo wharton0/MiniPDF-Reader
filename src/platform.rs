@@ -201,6 +201,7 @@ unsafe fn show_print_dialog_impl(total_pages: i32) -> Result<PrintDialogResult, 
         if pd.h_dev_names != 0 {
             GlobalFree(pd.h_dev_names);
         }
+        CoUninitialize();
         return Err(if cderr == 0 {
             "Print cancelled".to_owned()
         } else {
@@ -226,6 +227,7 @@ unsafe fn show_print_dialog_impl(total_pages: i32) -> Result<PrintDialogResult, 
         if pd.h_dev_names != 0 {
             GlobalFree(pd.h_dev_names);
         }
+        CoUninitialize();
         return Err("No pages to print".to_owned());
     }
 
@@ -233,7 +235,7 @@ unsafe fn show_print_dialog_impl(total_pages: i32) -> Result<PrintDialogResult, 
     let printer_w = GetDeviceCaps(pd.hdc, HORZRES);
     let printer_h = GetDeviceCaps(pd.hdc, VERTRES);
 
-    Ok(PrintDialogResult {
+    let result = PrintDialogResult {
         hdc: pd.hdc,
         h_dev_mode: pd.h_dev_mode,
         h_dev_names: pd.h_dev_names,
@@ -241,7 +243,9 @@ unsafe fn show_print_dialog_impl(total_pages: i32) -> Result<PrintDialogResult, 
         copies,
         printer_w,
         printer_h,
-    })
+    };
+    CoUninitialize();
+    Ok(result)
 }
 
 #[cfg(not(windows))]

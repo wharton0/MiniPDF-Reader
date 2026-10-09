@@ -75,25 +75,55 @@ fn spawn_worker<T: Send + 'static>(
 const MAX_RECENT: usize = 8;
 const MAX_PLACES: usize = 50;
 
-fn state_path() -> PathBuf {
+/// Candidate state-file locations, in priority order: next to the exe
+/// (portable), then %APPDATA%\MiniPDF (writable when the exe lives in a
+/// protected folder like Program Files), then the temp dir as last resort.
+fn state_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            return dir.join("minipdf-state.json");
+            v.push(dir.join("minipdf-state.json"));
         }
     }
-    std::env::temp_dir().join("minipdf-state.json")
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        v.push(
+            PathBuf::from(appdata)
+                .join("MiniPDF")
+                .join("minipdf-state.json"),
+        );
+    }
+    v.push(std::env::temp_dir().join("minipdf-state.json"));
+    v
 }
 
 fn load_state() -> AppStateFile {
-    std::fs::read(state_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    for p in state_dirs() {
+        if let Ok(b) = std::fs::read(&p) {
+            if let Ok(s) = serde_json::from_slice(&b) {
+                return s;
+            }
+        }
+    }
+    AppStateFile::default()
 }
 
 fn save_state(state: &AppStateFile) {
-    if let Ok(b) = serde_json::to_vec(state) {
-        let _ = std::fs::write(state_path(), b);
+    let bytes = match serde_json::to_vec(state) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    for p in state_dirs() {
+        if let Some(dir) = p.parent() {
+            if !dir.exists() && std::fs::create_dir_all(dir).is_err() {
+                continue;
+            }
+        }
+        // tmp + rename so a crash mid-write can't corrupt the state file
+        let tmp = p.with_extension("json.minipdf-tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
+            return;
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -381,7 +411,7 @@ impl MiniPdf {
         for (path, result) in completed {
             self.opening.retain(|p| *p != path);
             match result {
-                Ok(n) => {
+                Ok(n) if n > 0 => {
                     let title = path
                         .file_name()
                         .map(|s| s.to_string_lossy().to_string())
@@ -389,7 +419,7 @@ impl MiniPdf {
                     push_recent(&mut self.recent, path.clone());
                     let mut tab = DocTab::new(path, n, HashMap::new());
                     if let Some(place) = self.places.get(&tab.path) {
-                        tab.cur = place.page.clamp(0, n - 1).max(0);
+                        tab.cur = place.page.clamp(0, n.saturating_sub(1));
                         if place.zoom >= 0.2 && place.zoom <= 4.0 {
                             tab.zoom = place.zoom;
                         }
@@ -401,6 +431,7 @@ impl MiniPdf {
                     self.persist();
                     self.status = format!("Opened {title}, {n} pages");
                 }
+                Ok(_) => self.status = format!("Open failed: file has no pages"),
                 Err(e) => self.status = e,
             }
         }
@@ -445,7 +476,12 @@ impl MiniPdf {
                         );
                     }
                 }
-                Err(e) => self.status = format!("Search failed: {e}"),
+                Err(e) => {
+                    if idx == self.active {
+                        self.status = format!("Search failed: {e}");
+                    }
+                    log_line(&format!("background search failed: {e}"));
+                }
             }
         }
         self.start_pending_search();
@@ -487,10 +523,21 @@ impl MiniPdf {
                 }
                 other => {
                     self.render_failed.insert(key);
-                    self.status = match other {
+                    let msg = match other {
                         Err(e) => e,
                         _ => "Invalid render size".to_owned(),
                     };
+                    // A failed off-screen page must not clobber the user's
+                    // status line: surface it only for the visible tab.
+                    let visible = self
+                        .tabs
+                        .iter()
+                        .position(|t| t.version == version)
+                        .map_or(false, |i| i == self.active);
+                    if visible {
+                        self.status = msg.clone();
+                    }
+                    log_line(&format!("background render failed: {msg}"));
                 }
             }
         }
@@ -533,6 +580,9 @@ impl MiniPdf {
                 ));
             }
         }
+        if bytes <= TEXTURE_BUDGET {
+            return;
+        }
         entries.sort_unstable();
         for (_, _, idx, page, width, size) in entries.into_iter().rev() {
             if bytes <= TEXTURE_BUDGET {
@@ -566,7 +616,15 @@ impl MiniPdf {
                 }
                 Err(e) => {
                     self.layer_failed.insert(key);
-                    self.status = e;
+                    let visible = self
+                        .tabs
+                        .iter()
+                        .position(|t| t.version == key.0)
+                        .map_or(false, |i| i == self.active);
+                    if visible {
+                        self.status = e.clone();
+                    }
+                    log_line(&format!("background layer fetch failed: {e}"));
                 }
             }
         }
@@ -600,6 +658,11 @@ impl MiniPdf {
             if !self.outline_in_flight.remove(&version) {
                 continue;
             }
+            let visible = self
+                .tabs
+                .iter()
+                .position(|t| t.version == version)
+                .map_or(false, |i| i == self.active);
             let Some(tab) = self.tabs.iter_mut().find(|t| t.version == version) else {
                 continue;
             };
@@ -609,7 +672,10 @@ impl MiniPdf {
                 }
                 Err(e) => {
                     tab.outline = Some(Vec::new());
-                    self.status = e;
+                    if visible {
+                        self.status = e.clone();
+                    }
+                    log_line(&format!("background outline fetch failed: {e}"));
                 }
             }
         }
@@ -643,6 +709,11 @@ impl MiniPdf {
             if !self.notes_in_flight.remove(&version) {
                 continue;
             }
+            let visible = self
+                .tabs
+                .iter()
+                .position(|t| t.version == version)
+                .map_or(false, |i| i == self.active);
             let Some(tab) = self.tabs.iter_mut().find(|t| t.version == version) else {
                 continue;
             };
@@ -652,7 +723,10 @@ impl MiniPdf {
                 }
                 Err(e) => {
                     tab.notes = Some(Vec::new());
-                    self.status = e;
+                    if visible {
+                        self.status = e.clone();
+                    }
+                    log_line(&format!("background notes fetch failed: {e}"));
                 }
             }
         }
@@ -782,7 +856,7 @@ impl MiniPdf {
                 Ok(()) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
                         tab.pages = new_len;
-                        tab.cur = tab.cur.clamp(0, new_len - 1);
+                        tab.cur = tab.cur.clamp(0, new_len.saturating_sub(1));
                         tab.scroll_target = None;
                         tab.selection = None;
                         tab.page_tex.clear();
@@ -1967,7 +2041,7 @@ impl MiniPdf {
         if let Some(tab) = self.tabs.get_mut(tab_idx) {
             tab.search_cursor = cursor.min(total - 1);
             let n = tab.pages;
-            tab.cur = page.clamp(0, n - 1);
+            tab.cur = page.clamp(0, n.saturating_sub(1));
             tab.scroll_target = Some(tab.cur);
             tab.scroll_to_match = true;
         }
@@ -2956,6 +3030,36 @@ impl MiniPdf {
         });
     }
 
+    /// Right-click menu shared by rendered and placeholder thumbnails.
+    fn page_context_menu(&mut self, ui: &mut egui::Ui, tab_idx: usize, i: i32, pages: i32) {
+        if ui.button("Rotate left").clicked() {
+            self.rotate_page(tab_idx, i, true);
+            ui.close();
+        }
+        if ui.button("Rotate right").clicked() {
+            self.rotate_page(tab_idx, i, false);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(pages > 1, egui::Button::new("Delete page"))
+            .on_hover_text("Delete this page (saves file)")
+            .clicked()
+        {
+            self.delete_page(tab_idx, i);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .button("Append PDF…")
+            .on_hover_text("Merge another PDF at the end (saves file)")
+            .clicked()
+        {
+            self.append_pdf(tab_idx);
+            ui.close();
+        }
+    }
+
     /// Thumbnails: render only the visible range, max 3 per frame, fill in gradually.
     fn thumbs(&mut self, ui: &mut egui::Ui, tab_idx: usize, pages: i32) {
         let mut budget = 3;
@@ -2990,35 +3094,7 @@ impl MiniPdf {
                     }
                     // Preview-style page management on right-click.
                     tresp.context_menu(|ui| {
-                        if ui.button("Rotate left").clicked() {
-                            self.rotate_page(tab_idx, i, true);
-                            ui.close();
-                        }
-                        if ui.button("Rotate right").clicked() {
-                            self.rotate_page(tab_idx, i, false);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(
-                                pages > 1,
-                                egui::Button::new("Delete page"),
-                            )
-                            .on_hover_text("Delete this page (saves file)")
-                            .clicked()
-                        {
-                            self.delete_page(tab_idx, i);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Append PDF…")
-                            .on_hover_text("Merge another PDF at the end (saves file)")
-                            .clicked()
-                        {
-                            self.append_pdf(tab_idx);
-                            ui.close();
-                        }
+                        self.page_context_menu(ui, tab_idx, i, pages);
                     });
                     if ui.is_rect_visible(tresp.rect) {
                         let dark = ui.visuals().dark_mode;
@@ -3049,35 +3125,7 @@ impl MiniPdf {
                         self.goto(tab_idx, i);
                     }
                     resp.context_menu(|ui| {
-                        if ui.button("Rotate left").clicked() {
-                            self.rotate_page(tab_idx, i, true);
-                            ui.close();
-                        }
-                        if ui.button("Rotate right").clicked() {
-                            self.rotate_page(tab_idx, i, false);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(
-                                pages > 1,
-                                egui::Button::new("Delete page"),
-                            )
-                            .on_hover_text("Delete this page (saves file)")
-                            .clicked()
-                        {
-                            self.delete_page(tab_idx, i);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Append PDF…")
-                            .on_hover_text("Merge another PDF at the end (saves file)")
-                            .clicked()
-                        {
-                            self.append_pdf(tab_idx);
-                            ui.close();
-                        }
+                        self.page_context_menu(ui, tab_idx, i, pages);
                     });
                     let visible = ui.is_rect_visible(resp.rect);
                     if (visible || i == cur) && budget > 0 {

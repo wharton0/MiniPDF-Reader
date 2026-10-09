@@ -205,17 +205,49 @@ pub fn ensure_pdfium() -> Result<Pdfium, String> {
 }
 
 fn finish_bind(bindings: Box<dyn PdfiumLibraryBindings>) -> Result<Pdfium, String> {
-    let mut pdfium = Pdfium::new(bindings);
-    match find_cjk_font_path().and_then(|p| std::fs::read(p).ok()) {
+    match cached_cjk_bytes() {
         Some(cjk) => {
-            let latin = find_latin_font_bytes();
-            pdfium.set_custom_font_provider(Box::new(CjkFallbackProvider::new(cjk, latin)));
+            let latin = cached_latin_font_bytes();
+            pdfium_set_provider(Pdfium::new(bindings), cjk, latin)
         }
         None => {
+            let mut pdfium = Pdfium::new(bindings);
             // 没有 cjk.ttf:至少打开系统 provider,能显示已安装的中文字体。
             let _ = pdfium.use_platform_default_font_provider();
+            return leak_bind(pdfium);
         }
     }
+}
+
+/// Font bytes are read from disk once per process: every background worker
+/// calls `ensure_pdfium()`, and re-reading ~19 MB of font files per page
+/// render would dominate the worker's startup cost.
+static CJK_BYTES: std::sync::OnceLock<(PathBuf, Vec<u8>)> = std::sync::OnceLock::new();
+static LATIN_BYTES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+
+fn cached_cjk_bytes() -> Option<Vec<u8>> {
+    let path = find_cjk_font_path()?;
+    if let Some((cached_path, bytes)) = CJK_BYTES.get() {
+        if *cached_path == path {
+            return Some(bytes.clone());
+        }
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    // A lost set-race just means another thread cached identical content.
+    let _ = CJK_BYTES.set((path, bytes.clone()));
+    Some(bytes)
+}
+
+fn cached_latin_font_bytes() -> Option<Vec<u8>> {
+    LATIN_BYTES.get_or_init(find_latin_font_bytes).clone()
+}
+
+fn pdfium_set_provider(mut pdfium: Pdfium, cjk: Vec<u8>, latin: Option<Vec<u8>>) -> Result<Pdfium, String> {
+    pdfium.set_custom_font_provider(Box::new(CjkFallbackProvider::new(cjk, latin)));
+    leak_bind(pdfium)
+}
+
+fn leak_bind(pdfium: Pdfium) -> Result<Pdfium, String> {
     // provider 指针被 pdfium 库全局持有,必须活到进程结束:任何短命调用者
     // (后台线程、单次抓取) 的提前释放都会留下悬垂指针,多线程下直接崩溃。
     // 因此泄漏此次绑定,返回复用全局绑定的轻量句柄。
