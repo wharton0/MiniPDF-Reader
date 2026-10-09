@@ -8,10 +8,6 @@ A Windows-only minimal PDF viewer built in Rust with **Pdfium** (rendering) and 
 cargo build                 # debug build (uses build.rs to embed app icon via rc.exe if available)
 cargo build --release       # release build (opt-level 2, stripped)
 cargo run -- <file.pdf>     # launch viewer with one or more PDFs pre-opened as tabs
-cargo run --example make_test_pdf   # generate target/mark_test.pdf (minimal 1-page test doc)
-cargo run --example render_test -- <file.pdf> [page]  # headless render of a page to PNG
-cargo run --example make_icon       # generate assets/minipdf.ico from logo-256.png
-cargo run --example mark_test       # markup/annotation test harness
 ```
 
 There is **no test suite, no linter config, no CI**. Verification is manual: build, launch, interact.
@@ -30,7 +26,7 @@ There is **no test suite, no linter config, no CI**. Verification is manual: bui
 
 ### Module split
 
-- `src/lib.rs` — Pdfium binding + **custom font fallback provider** (`CjkFallbackProvider`). This is shared with the examples, so it's a library crate.
+- `src/lib.rs` — Pdfium binding + **custom font fallback provider** (`CjkFallbackProvider`).
 - `src/main.rs` — the entire GUI application (~3100 lines, one file). Everything below lives here.
 
 ### Core types
